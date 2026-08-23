@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#111" />
+  <title>Guitar Tuner</title>
+  <style>
+    *{box-sizing:border-box}
+    body{
+      margin:0;min-height:100vh;display:grid;place-items:center;
+      font:16px system-ui,sans-serif;background:#111;color:#eee
+    }
+    main{width:min(92vw,420px);text-align:center}
+    h1{font-size:1.2rem;font-weight:600;margin:0 0 2rem}
+    #note{font-size:6rem;font-weight:800;line-height:1}
+    #hz{opacity:.65;margin:.5rem 0 1.5rem}
+    .meter{
+      position:relative;height:12px;background:#333;border-radius:99px;
+      overflow:hidden;margin:0 0 .75rem
+    }
+    .meter:after{
+      content:"";position:absolute;left:50%;top:0;width:2px;height:100%;
+      background:#fff;transform:translateX(-1px)
+    }
+    #needle{
+      position:absolute;left:50%;top:0;width:8px;height:100%;
+      background:#ddd;border-radius:99px;transform:translateX(-50%)
+    }
+    #cents{font-variant-numeric:tabular-nums;min-height:1.5em}
+    select{
+      width:100%;margin-top:1.25rem;padding:.75rem .9rem;border:1px solid #444;
+      border-radius:10px;background:#1b1b1b;color:#eee;font:inherit
+    }
+    #tuningNotes{margin-top:.65rem;opacity:.7;font-size:.9rem}
+    button{
+      margin-top:1.5rem;border:0;border-radius:999px;padding:.8rem 1.2rem;
+      font:inherit;font-weight:700;cursor:pointer
+    }
+    small{display:block;margin-top:1.25rem;opacity:.5}
+    .good #note{color:#7ee787}
+    .good #needle{background:#7ee787}
+  </style>
+</head>
+<body>
+<main id="app">
+  <h1>Guitar Tuner</h1>
+  <div id="note">—</div>
+  <div id="hz">Tap start and play a string</div>
+  <div class="meter"><div id="needle"></div></div>
+  <div id="cents">♭ flat · in tune · sharp ♯</div>
+  <label for="tuning" style="display:block;margin-top:1.25rem;text-align:left;opacity:.75">
+    Tuning
+  </label>
+  <select id="tuning">
+    <option value="standard">Standard — E A D G B E</option>
+    <option value="dropD">Drop D — D A D G B E</option>
+    <option value="eb">E♭ Standard — E♭ A♭ D♭ G♭ B♭ E♭</option>
+    <option value="dStandard">D Standard — D G C F A D</option>
+    <option value="dropCSharp">Drop C♯ — C♯ G♯ C♯ F♯ A♯ D♯</option>
+    <option value="dropC">Drop C — C G C F A D</option>
+    <option value="dropB">Drop B — B F♯ B E G♯ C♯</option>
+    <option value="openG">Open G — D G D G B D</option>
+    <option value="dadgad">DADGAD — D A D G A D</option>
+  </select>
+  <div id="tuningNotes">E2 · A2 · D3 · G3 · B3 · E4</div>
+  <button id="start">Start tuner</button>
+  <small>Tip: tune one string at a time.</small>
+</main>
+
+<script>
+const noteEl = document.querySelector("#note");
+const hzEl = document.querySelector("#hz");
+const centsEl = document.querySelector("#cents");
+const needle = document.querySelector("#needle");
+const start = document.querySelector("#start");
+const app = document.querySelector("#app");
+const tuning = document.querySelector("#tuning");
+const tuningNotes = document.querySelector("#tuningNotes");
+
+const tunings = {
+  standard: ["E2","A2","D3","G3","B3","E4"],
+  dropD: ["D2","A2","D3","G3","B3","E4"],
+  eb: ["D♯2","G♯2","C♯3","F♯3","A♯3","D♯4"],
+  dStandard: ["D2","G2","C3","F3","A3","D4"],
+  dropCSharp: ["C♯2","G♯2","C♯3","F♯3","A♯3","D♯4"],
+  dropC: ["C2","G2","C3","F3","A3","D4"],
+  dropB: ["B1","F♯2","B2","E3","G♯3","C♯4"],
+  openG: ["D2","G2","D3","G3","B3","D4"],
+  dadgad: ["D2","A2","D3","G3","A3","D4"]
+};
+
+tuning.addEventListener("change", () => {
+  tuningNotes.textContent = tunings[tuning.value].join(" · ");
+});
+
+let audio, analyser, data, running = false;
+let smoothFreq = 0;
+let smoothCents = 0;
+let recentFreqs = [];
+let lastStableAt = 0;
+let lastUiUpdate = 0;
+
+const DETECT_RMS = 0.003;   // pitch detector sensitivity
+const UPDATE_RMS = 0.006;   // only move the meter on a stronger signal
+const HOLD_MS = 700;        // hold last stable reading as the note fades
+const UPDATE_MS = 55;       // cap visual updates to reduce jitter
+
+start.onclick = async () => {
+  if (running) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}
+    });
+    audio = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audio.createAnalyser();
+    analyser.fftSize = 2048;
+    data = new Float32Array(analyser.fftSize);
+    audio.createMediaStreamSource(stream).connect(analyser);
+    running = true;
+    start.textContent = "Listening…";
+    start.disabled = true;
+    tick();
+  } catch {
+    hzEl.textContent = "Microphone access is required.";
+  }
+};
+
+function tick(now = performance.now()){
+  analyser.getFloatTimeDomainData(data);
+
+  let rms = 0;
+  for (const v of data) rms += v * v;
+  rms = Math.sqrt(rms / data.length);
+
+  const rawFreq = autoCorrelate(data, audio.sampleRate);
+
+  // Only feed solid pitch readings into the display smoother.
+  if (rawFreq > 70 && rawFreq < 400 && rms >= UPDATE_RMS) {
+    recentFreqs.push(rawFreq);
+    if (recentFreqs.length > 5) recentFreqs.shift();
+
+    // Median filtering removes one-frame octave/noise spikes.
+    const sorted = [...recentFreqs].sort((a,b) => a-b);
+    const medianFreq = sorted[Math.floor(sorted.length / 2)];
+
+    // Ignore isolated large jumps unless they persist in the median window.
+    const jump = smoothFreq ? Math.abs(medianFreq - smoothFreq) / smoothFreq : 0;
+    if (!smoothFreq || jump < 0.08 || recentFreqs.length >= 4) {
+      smoothFreq = smoothFreq
+        ? smoothFreq * 0.9 + medianFreq * 0.1
+        : medianFreq;
+
+      lastStableAt = now;
+    }
+  }
+
+  const holding = smoothFreq > 0 && (now - lastStableAt) < HOLD_MS;
+
+  // Update the visible meter at a calmer rate, and freeze it during decay.
+  if (holding && now - lastUiUpdate >= UPDATE_MS) {
+    const freq = smoothFreq;
+    const midi = Math.round(69 + 12 * Math.log2(freq / 440));
+    const names = ["C","C♯","D","D♯","E","F","F♯","G","G♯","A","A♯","B"];
+    const name = names[(midi + 1200) % 12];
+    const octave = Math.floor(midi / 12) - 1;
+    const target = 440 * Math.pow(2, (midi - 69) / 12);
+    const rawCents = 1200 * Math.log2(freq / target);
+
+    smoothCents = smoothCents * 0.9 + rawCents * 0.1;
+    const cents = Math.round(smoothCents);
+
+    noteEl.textContent = name + octave;
+    hzEl.textContent = freq.toFixed(1) + " Hz";
+    centsEl.textContent = cents === 0
+      ? "In tune"
+      : `${Math.abs(cents)}¢ ${cents < 0 ? "flat" : "sharp"}`;
+
+    needle.style.left =
+      (50 + Math.max(-45, Math.min(45, cents * 0.6))) + "%";
+
+    app.classList.toggle("good", Math.abs(cents) <= 5);
+    lastUiUpdate = now;
+  }
+
+  // After the held reading expires, return to idle instead of following noise.
+  if (!holding && smoothFreq > 0) {
+    smoothFreq = 0;
+    smoothCents = 0;
+    recentFreqs = [];
+    noteEl.textContent = "—";
+    hzEl.textContent = "Play a string";
+    centsEl.textContent = "♭ flat · in tune · sharp ♯";
+    needle.style.left = "50%";
+    app.classList.remove("good");
+  }
+
+  requestAnimationFrame(tick);
+}
+
+function autoCorrelate(buf, rate){
+  let rms = 0;
+  for (const v of buf) rms += v*v;
+  rms = Math.sqrt(rms / buf.length);
+  if (rms < DETECT_RMS) return -1;
+
+  let start = 0, end = buf.length - 1, threshold = .2;
+  for (let i=0;i<buf.length/2;i++) if (Math.abs(buf[i]) < threshold) { start=i; break; }
+  for (let i=1;i<buf.length/2;i++) if (Math.abs(buf[buf.length-i]) < threshold) { end=buf.length-i; break; }
+
+  const x = buf.slice(start,end);
+  const size = x.length;
+  const c = new Array(size).fill(0);
+
+  for (let lag=0;lag<size;lag++)
+    for (let i=0;i<size-lag;i++)
+      c[lag] += x[i] * x[i+lag];
+
+  let d = 0;
+  while (d+1<size && c[d] > c[d+1]) d++;
+
+  let max = -1, pos = -1;
+  for (let i=d;i<size;i++) if (c[i] > max) { max=c[i]; pos=i; }
+  if (pos <= 0) return -1;
+
+  const y0 = c[pos-1] || c[pos], y1 = c[pos], y2 = c[pos+1] || c[pos];
+  const a = (y0 + y2 - 2*y1) / 2;
+  const b = (y2 - y0) / 2;
+  const refined = a ? pos - b/(2*a) : pos;
+
+  return rate / refined;
+}
+</script>
+</body>
+</html>
